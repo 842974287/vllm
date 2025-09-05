@@ -21,6 +21,7 @@ from vllm.v1.attention.backends.mla.common import (MLACommonBackend,
 from vllm.v1.attention.backends.utils import AttentionCGSupport
 from vllm.v1.kv_cache_interface import AttentionSpec
 from aiter import get_mla_metadata_v1
+from vllm import _custom_ops as ops
 
 # yapf: enable
 
@@ -280,6 +281,18 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         B = q_nope.shape[0]
 
         q = torch.cat([q_nope, q_pe], dim=-1)
+        if is_fp8:
+            q_shape = q.shape
+            q, q_scale = ops.scaled_fp8_quant(
+                q.reshape([
+                    q_shape[0], q_shape[1] * q_shape[2]
+                ]))
+            q = q.reshape(q_shape)
+            kv_scale = torch.ones([1], dtype=torch.float32, device=q_nope.device)
+        else:
+            q_scale = None
+            kv_scale = None
+
         o = torch.zeros(B,
                         self.num_heads,
                         self.kv_lora_rank,
