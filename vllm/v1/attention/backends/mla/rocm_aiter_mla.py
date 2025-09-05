@@ -20,6 +20,7 @@ from vllm.v1.attention.backends.mla.common import (MLACommonBackend,
                                                    MLACommonMetadataBuilder)
 from vllm.v1.attention.backends.utils import AttentionCGSupport
 from vllm.v1.kv_cache_interface import AttentionSpec
+from aiter import get_mla_metadata_v1
 
 # yapf: enable
 
@@ -59,6 +60,14 @@ class AiterMLADecodeMetadata(MLACommonDecodeMetadata):
     paged_kv_last_page_len: Optional[torch.Tensor] = None
     # The query indptr, shape : [num_decode + 1]
     qo_indptr: Optional[torch.Tensor] = None
+
+    work_meta_data: Optional[torch.Tensor] = None
+    work_info_set: Optional[torch.Tensor] = None
+    work_indptr: Optional[torch.Tensor] = None
+    reduce_indptr: Optional[torch.Tensor] = None
+    reduce_final_map: Optional[torch.Tensor] = None
+    reduce_partial_map: Optional[torch.Tensor] = None
+
 
 
 class AiterMLAMetadata(MLACommonMetadata[AiterMLADecodeMetadata]):
@@ -154,13 +163,46 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
                                      dtype=torch.int32,
                                      device=device)
 
+        # aiter implementation
+        batch_size = num_reqs
+        num_cu = torch.cuda.get_device_properties(device).multi_processor_count
+        work_meta_data     = torch.empty([10], dtype=torch.uint64, device=device)
+        work_indptr        = torch.empty([num_cu + 1], dtype=torch.int32, device=device)
+        work_info_set      = torch.empty([batch_size * num_cu, 8], dtype=torch.int32, device=device)
+        reduce_indptr      = torch.empty([batch_size + 1], dtype=torch.int32, device=device)
+        reduce_final_map   = torch.empty([batch_size, 2], dtype=torch.int32, device=device)
+        reduce_partial_map = torch.empty([batch_size * num_cu], dtype=torch.int32, device=device)
+
+        _ = get_mla_metadata_v1(
+            qo_indptr,
+            paged_kv_indptr,
+            self.num_heads,
+            1,
+            True,
+            max(page_size, 16),
+            work_meta_data,
+            work_info_set,
+            work_indptr,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+        )
+
+
         attn_metadata = AiterMLADecodeMetadata(
             block_table=block_table_tensor,
             seq_lens=seq_lens,
             paged_kv_indptr=paged_kv_indptr,
             paged_kv_indices=paged_kv_indices,
             paged_kv_last_page_len=paged_kv_last_page_len,
-            qo_indptr=qo_indptr)
+            qo_indptr=qo_indptr,
+            work_meta_data=work_meta_data,
+            work_info_set=work_info_set,
+            work_indptr=work_indptr,
+            reduce_indptr=reduce_indptr,
+            reduce_final_map=reduce_final_map,
+            reduce_partial_map=reduce_partial_map,
+        )
 
         return attn_metadata
 
@@ -224,6 +266,14 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         attn_metadata: AiterMLAMetadata,
         layer: AttentionLayer,
     ) -> torch.Tensor:
+        is_fp8 = self.kv_cache_dtype.startswith("fp8")
+        if is_fp8:
+            q_scale = layer._q_scale
+            kv_scale = torch.ones([1], dtype=torch.float32, device=q_nope.device)
+        else:
+            q_scale = None
+            kv_scale = None
+
         assert kv_c_and_k_pe_cache.numel() > 0
         assert attn_metadata.decode is not None
 
@@ -233,7 +283,7 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         o = torch.zeros(B,
                         self.num_heads,
                         self.kv_lora_rank,
-                        dtype=q.dtype,
+                        dtype=torch.bfloat16,
                         device=q.device)
 
         kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
@@ -245,6 +295,14 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
                              attn_metadata.decode.qo_indptr, max_seqlen_qo,
                              attn_metadata.decode.paged_kv_indptr,
                              attn_metadata.decode.paged_kv_indices,
-                             attn_metadata.decode.paged_kv_last_page_len)
+                             attn_metadata.decode.paged_kv_last_page_len,
+                             work_meta_data=attn_metadata.decode.work_meta_data,
+                             work_info_set=attn_metadata.decode.work_info_set,
+                             work_indptr=attn_metadata.decode.work_indptr,
+                             reduce_indptr=attn_metadata.decode.reduce_indptr,
+                             reduce_final_map=attn_metadata.decode.reduce_final_map,
+                             reduce_partial_map=attn_metadata.decode.reduce_partial_map,
+                             q_scale=q_scale,
+                             kv_scale=kv_scale)
 
         return self._v_up_proj(o)
