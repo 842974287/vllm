@@ -114,12 +114,15 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
                                           dtype=torch.int32,
                                           device=device)
 
-    def _build_decode(self, block_table_tensor: torch.Tensor,
-                      seq_lens: torch.Tensor) -> AiterMLADecodeMetadata:
+    def _build_decode(
+            self, block_table_tensor: torch.Tensor, seq_lens_cpu: torch.Tensor,
+            seq_lens_device: torch.Tensor, query_start_loc_cpu: torch.Tensor,
+            query_start_loc_device: torch.Tensor) -> AiterMLADecodeMetadata:
         page_size = self.kv_cache_spec.block_size
-        block_table_bounds = (seq_lens + page_size - 1) // page_size
+        assert page_size == 1
+        block_table_bounds = (seq_lens_device + page_size - 1) // page_size
         device = self.device
-        num_reqs = seq_lens.size(0)
+        num_reqs = seq_lens_device.size(0)
 
         mask = (torch.arange(block_table_tensor.size(1),
                              dtype=block_table_tensor.dtype,
@@ -127,7 +130,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
                 < block_table_bounds.unsqueeze(1))
         paged_kv_indices = block_table_tensor[mask]
 
-        paged_kv_last_page_len = seq_lens % page_size
+        paged_kv_last_page_len = seq_lens_device % page_size
         paged_kv_last_page_len = torch.where(paged_kv_last_page_len == 0,
                                              page_size, paged_kv_last_page_len)
 
@@ -174,13 +177,13 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         reduce_final_map   = torch.empty([batch_size, 2], dtype=torch.int32, device=device)
         reduce_partial_map = torch.empty([batch_size * num_cu], dtype=torch.int32, device=device)
 
+        # TODO: print last five.
         _ = get_mla_metadata_v1(
             qo_indptr,
             paged_kv_indptr,
             self.num_heads,
             1,
             True,
-            max(page_size, 16),
             work_meta_data,
             work_info_set,
             work_indptr,
@@ -188,11 +191,16 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             reduce_final_map,
             reduce_partial_map,
         )
+        print(f"{work_info_set=}")
+        print(f"{work_indptr=}")
+        print(f"{reduce_indptr=}")
+        print(f"{reduce_final_map=}")
+        print(f"{reduce_partial_map=}")
 
 
         attn_metadata = AiterMLADecodeMetadata(
             block_table=block_table_tensor,
-            seq_lens=seq_lens,
+            seq_lens=seq_lens_device,
             paged_kv_indptr=paged_kv_indptr,
             paged_kv_indices=paged_kv_indices,
             paged_kv_last_page_len=paged_kv_last_page_len,
@@ -304,6 +312,7 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         # max_seqlen_qo must be 1 except for MTP
         # TODO: Find the best value for MTP
         max_seqlen_qo = 1
+        # TODO compare to torch_mla_extend
         aiter_mla_decode_fwd(q, kv_buffer, o, self.scale,
                              attn_metadata.decode.qo_indptr, max_seqlen_qo,
                              attn_metadata.decode.paged_kv_indptr,
